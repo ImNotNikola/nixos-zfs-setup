@@ -33,14 +33,9 @@ DISK=(/dev/vda)
 
 # How to name the partitions. This will be visible in 'gdisk -l /dev/disk' and
 # in /dev/disk/by-partlabel.
-PART_MBR="bootcode"
-PART_EFI="efiboot"
-PART_BOOT="bpool"
-PART_SWAP="swap"
+PART_GPT="gpt"
+PART_EFI="efi"
 PART_ROOT="rpool"
-
-# How much swap per disk?
-SWAPSIZE=2G
 
 # The type of virtual device for boot and root. If kept empty, the disks will
 # be joined (two 1T disks will give you ~2TB of data). Other valid options are
@@ -51,7 +46,6 @@ SWAPSIZE=2G
 #ZFS_ROOT_VDEV="mirror"
 
 # How to name the boot pool and root pool.
-ZFS_BOOT="bpool"
 ZFS_ROOT="rpool"
 
 # How to name the root volume in which nixos will be installed.
@@ -77,57 +71,24 @@ MAINCFG="/mnt/etc/nixos/configuration.nix"
 HWCFG="/mnt/etc/nixos/hardware-configuration.nix"
 ZFSCFG="/mnt/etc/nixos/zfs.nix"
 
-if [[ ${#DISK[*]} -eq 1 ]] && [[ -n ${ZFS_BOOT_VDEV} || -n ${ZFS_ROOT_VDEV} ]]
-then
-	echo "Error: You have only specified one disk. ZFS_BOOT_VDEV and ZFS_ROOT_DEV must be unset or empty." >&2
-	false
-fi
-
-if [[ -z ${ROOTPW} ]]
-then
-	echo "Error: Please generate a password hash and put that in this file's ROOTPW variable." >&2
-	false
-fi
-
 set -x
 
 i=0 SWAPDEVS=()
 for d in ${DISK[*]}
 do
 	sgdisk --zap-all ${d}
-	sgdisk -a1 -n1:0:+100K -t1:EF02 -c 1:${PART_MBR}${i} ${d}
+	sgdisk -a1 -n1:0:+100K -t1:EF02 -c 1:${PART_GPT}${i} ${d}
 	sgdisk -n2:1M:+1G -t2:EF00 -c 2:${PART_EFI}${i} ${d}
-	sgdisk -n3:0:+4G -t3:BE00 -c 3:${PART_BOOT}${i} ${d}
-	sgdisk -n4:0:+${SWAPSIZE} -t4:8200 -c 4:${PART_SWAP}${i} ${d}
-	SWAPDEVS+=(${d}4)
-	sgdisk -n5:0:0 -t5:BF00 -c 5:${PART_ROOT}${i} ${d}
+	sgdisk -n3:0:+4G -t3:BE00 -c 3:${PART_ROOT}${i} ${d}
 
 	partprobe ${d}
 	sleep 2
-	mkswap -L ${PART_SWAP}fs${i} /dev/disk/by-partlabel/${PART_SWAP}${i}
-	swapon /dev/disk/by-partlabel/${PART_SWAP}${i}
 	(( i++ )) || true
 done
 unset i d
 
 # Wait for a bit to let udev catch up and generate /dev/disk/by-partlabel.
 sleep 3s
-
-# Create the boot pool
-zpool create \
-	-o compatibility=grub2 \
-	-o ashift=12 \
-	-o autotrim=on \
-	-O acltype=posixacl \
-	-O compression=lz4 \
-	-O devices=off \
-	-O normalization=formD \
-	-O relatime=on \
-	-O xattr=sa \
-	-O mountpoint=none \
-	-O checksum=sha256 \
-	-R /mnt \
-	${ZFS_BOOT} ${ZFS_BOOT_VDEV} /dev/disk/by-partlabel/${PART_BOOT}*
 
 # Create the root pool
 zpool create \
@@ -139,15 +100,11 @@ zpool create \
 	-O relatime=on \
 	-O xattr=sa \
 	-O mountpoint=none \
-	-O checksum=edonr \
 	-R /mnt \
 	${ZFS_ROOT} ${ZFS_ROOT_VDEV} /dev/disk/by-partlabel/${PART_ROOT}*
 
-# Create the boot dataset
-zfs create ${ZFS_BOOT}/${ZFS_ROOT_VOL}
-
 # Create the root dataset
-zfs create -o mountpoint=/     ${ZFS_ROOT}/${ZFS_ROOT_VOL}
+zfs create -o mountpoint=legacy -o compression=lz4 ${ZFS_ROOT}/${ZFS_ROOT_VOL}
 
 # Create datasets (subvolumes) in the root dataset
 zfs create ${ZFS_ROOT}/${ZFS_ROOT_VOL}/home
@@ -156,10 +113,11 @@ zfs create -o atime=off ${ZFS_ROOT}/${ZFS_ROOT_VOL}/nix
 zfs create ${ZFS_ROOT}/${ZFS_ROOT_VOL}/root
 zfs create ${ZFS_ROOT}/${ZFS_ROOT_VOL}/usr
 zfs create ${ZFS_ROOT}/${ZFS_ROOT_VOL}/var
+zfs create ${ZFS_ROOT}/${ZFS_ROOT_VOL}/var/lib/containers/storage
 
 # Create datasets (subvolumes) in the boot dataset
 # This comes last because boot order matters
-zfs create -o mountpoint=/boot ${ZFS_BOOT}/${ZFS_ROOT_VOL}/boot
+zfs create -o mountpoint=/boot ${ZFS_ROOT}/${ZFS_ROOT_VOL}/boot
 
 # Make empty snapshots of impermanent volumes
 if (( $IMPERMANENCE ))
@@ -195,80 +153,6 @@ chattr +i /mnt/etc/zfs/zpool.cache
 # Generate and edit configs
 nixos-generate-config --root /mnt
 
-sed -i -e "s|./hardware-configuration.nix|& ./zfs.nix|" ${MAINCFG}
-
-if (( $IMPERMANENCE ))
-then
-	echo '{ config, lib, pkgs, ... }:'
-else
-	echo '{ config, pkgs, ... }:'
-fi | tee -a ${ZFSCFG}
-
-tee -a ${ZFSCFG} <<EOF
-
-{
-  boot.supportedFilesystems = [ "zfs" ];
-  networking.hostId = "$(head -c 8 /etc/machine-id)";
-  boot.kernelPackages = config.boot.zfs.package.latestCompatibleLinuxPackages;
-  boot.zfs.devNodes = "/dev/disk/by-partlabel";
-EOF
-
-if (( $IMPERMANENCE ))
-then
-	tee -a ${ZFSCFG} <<EOF
-  boot.initrd.postDeviceCommands = lib.mkAfter ''
-    zfs rollback -r ${ZFS_ROOT}/${ZFS_ROOT_VOL}@${EMPTYSNAP}
-  '';
-EOF
-fi
-
-# Remove boot.loader stuff, it's to be added to zfs.nix
-sed -i '/boot.loader/d' ${MAINCFG}
-
-# Disable xserver. Comment them without a space after the pound sign so we can
-# recognize them when we edit the config later
-sed -i -e 's;^  \(services.xserver\);  #\1;' ${MAINCFG}
-
-tee -a ${ZFSCFG} <<-'EOF'
-  boot.loader.efi.efiSysMountPoint = "/boot/efi";
-  boot.loader.efi.canTouchEfiVariables = false;
-  boot.loader.generationsDir.copyKernels = true;
-  boot.loader.grub.efiInstallAsRemovable = true;
-  boot.loader.grub.enable = true;
-  boot.loader.grub.version = 2;
-  boot.loader.grub.copyKernels = true;
-  boot.loader.grub.efiSupport = true;
-  boot.loader.grub.zfsSupport = true;
-
-  boot.loader.grub.extraPrepareConfig = ''
-    mkdir -p /boot/efis
-    for i in  /boot/efis/*; do mount $i ; done
-
-    mkdir -p /boot/efi
-    mount /boot/efi
-  '';
-
-  boot.loader.grub.extraInstallCommands = ''
-    ESP_MIRROR=$(mktemp -d)
-    cp -r /boot/efi/EFI $ESP_MIRROR
-    for i in /boot/efis/*; do
-      cp -r $ESP_MIRROR/EFI $i
-    done
-    rm -rf $ESP_MIRROR
-  '';
-
-  boot.loader.grub.devices = [
-EOF
-
-for d in ${DISK[*]}; do
-  printf "    \"${d}\"\n" >>${ZFSCFG}
-done
-
-tee -a ${ZFSCFG} <<EOF
-  ];
-
-EOF
-
 sed -i 's|fsType = "zfs";|fsType = "zfs"; options = [ "zfsutil" "X-mount.mkdir" ];|g' ${HWCFG}
 
 ADDNR=$(awk '/^  fileSystems."\/" =$/ {print NR+3}' ${HWCFG})
@@ -301,12 +185,6 @@ EOF
 	rm -f ${TMPFILE}
 	unset ADDNR TMPFILE
 fi
-
-tee -a ${ZFSCFG} <<EOF
-users.users.root.initialHashedPassword = "${ROOTPW}";
-
-}
-EOF
 
 if (( $IMPERMANENCE ))
 then
